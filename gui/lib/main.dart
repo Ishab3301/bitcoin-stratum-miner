@@ -1,8 +1,13 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
+import 'dart:js_interop';
+
+@JS('playShareAcceptedChime')
+external void _playShareAcceptedChime();
 
 void main() {
   runApp(const BtcMinerApp());
@@ -14,7 +19,7 @@ class BtcMinerApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Bitcoin Stratum Miner',
+      title: 'Bitcoin Stratum & Solo RPC Miner',
       debugShowCheckedModeBanner: false,
       themeMode: ThemeMode.dark,
       theme: ThemeData(
@@ -53,6 +58,8 @@ class _MinerDashboardState extends State<MinerDashboard> with SingleTickerProvid
 
   // Telemetry
   double _liveMh = 0.0;
+  double _cpuMh = 0.0;
+  double _gpuMh = 0.0;
   double _avg5sMh = 0.0;
   double _totalAvgMh = 0.0;
   int _totalHashes = 0;
@@ -60,19 +67,28 @@ class _MinerDashboardState extends State<MinerDashboard> with SingleTickerProvid
   int _rejectedShares = 0;
   double _difficulty = 1.0;
   String _jobId = "-";
-  int _threads = 6;
+  int _threads = 8;
+  bool _gpuEnabled = true;
+  String _gpuName = "Intel(R) Iris(R) Xe Graphics";
+  bool _isRpcMode = false; // false = Stratum V1 Pool, true = Bitcoin Core RPC Solo
 
   final List<double> _hashrateHistory = List.filled(40, 0.0);
   final List<String> _logs = [];
   final ScrollController _logScrollController = ScrollController();
   bool _autoScroll = true;
 
-  // Presets and Controllers
+  // Stratum Presets and Controllers
   PoolPreset _selectedPreset = PoolPreset.soloCkPool;
   final TextEditingController _poolController = TextEditingController(text: "solo.ckpool.org");
   final TextEditingController _portController = TextEditingController(text: "3333");
   final TextEditingController _userController = TextEditingController(text: "1EUeWGhrKsrSmicJoSgYVgbbNAT4hFBzqS");
   final TextEditingController _passController = TextEditingController(text: "x");
+
+  // Bitcoin Core RPC Solo Controllers
+  final TextEditingController _rpcUrlController = TextEditingController(text: "http://127.0.0.1:8332");
+  final TextEditingController _rpcUserController = TextEditingController(text: "bitcoin");
+  final TextEditingController _rpcPassController = TextEditingController(text: "password");
+  final TextEditingController _rpcAddressController = TextEditingController(text: "1EUeWGhrKsrSmicJoSgYVgbbNAT4hFBzqS");
 
   late AnimationController _pulseController;
   late Animation<double> _pulseAnimation;
@@ -101,7 +117,19 @@ class _MinerDashboardState extends State<MinerDashboard> with SingleTickerProvid
     _portController.dispose();
     _userController.dispose();
     _passController.dispose();
+    _rpcUrlController.dispose();
+    _rpcUserController.dispose();
+    _rpcPassController.dispose();
+    _rpcAddressController.dispose();
     super.dispose();
+  }
+
+  void _triggerShareChime() {
+    if (kIsWeb) {
+      try {
+        _playShareAcceptedChime();
+      } catch (_) {}
+    }
   }
 
   void _applyPreset(PoolPreset preset) {
@@ -165,6 +193,8 @@ class _MinerDashboardState extends State<MinerDashboard> with SingleTickerProvid
         if (type == "init") {
           _isMining = data["is_mining"] as bool? ?? false;
           _liveMh = (data["live_mh"] as num?)?.toDouble() ?? 0.0;
+          _cpuMh = (data["cpu_mh"] as num?)?.toDouble() ?? 0.0;
+          _gpuMh = (data["gpu_mh"] as num?)?.toDouble() ?? 0.0;
           _avg5sMh = (data["avg_5s"] as num?)?.toDouble() ?? 0.0;
           _totalAvgMh = (data["total_avg"] as num?)?.toDouble() ?? 0.0;
           _totalHashes = (data["total_hashes"] as num?)?.toInt() ?? 0;
@@ -173,6 +203,16 @@ class _MinerDashboardState extends State<MinerDashboard> with SingleTickerProvid
           _difficulty = (data["difficulty"] as num?)?.toDouble() ?? 1.0;
           _jobId = data["job_id"] as String? ?? "-";
           _threads = (data["threads"] as num?)?.toInt() ?? _threads;
+
+          if (data["gpu_enabled"] != null) {
+            _gpuEnabled = data["gpu_enabled"] as bool;
+          }
+          if (data["gpu_name"] != null && (data["gpu_name"] as String).isNotEmpty) {
+            _gpuName = data["gpu_name"] as String;
+          }
+          if (data["mining_mode"] != null) {
+            _isRpcMode = (data["mining_mode"] as String) == "btcrpc";
+          }
 
           final logsList = data["logs"] as List<dynamic>?;
           if (logsList != null) {
@@ -184,6 +224,8 @@ class _MinerDashboardState extends State<MinerDashboard> with SingleTickerProvid
           _recordHashrate(_liveMh);
         } else if (type == "telemetry") {
           _liveMh = (data["live_mh"] as num?)?.toDouble() ?? _liveMh;
+          _cpuMh = (data["cpu_mh"] as num?)?.toDouble() ?? _cpuMh;
+          _gpuMh = (data["gpu_mh"] as num?)?.toDouble() ?? _gpuMh;
           _avg5sMh = (data["avg_5s"] as num?)?.toDouble() ?? _avg5sMh;
           _totalAvgMh = (data["total_avg"] as num?)?.toDouble() ?? _totalAvgMh;
           _totalHashes = (data["total_hashes"] as num?)?.toInt() ?? _totalHashes;
@@ -192,18 +234,37 @@ class _MinerDashboardState extends State<MinerDashboard> with SingleTickerProvid
           _difficulty = (data["difficulty"] as num?)?.toDouble() ?? _difficulty;
           _jobId = data["job_id"] as String? ?? _jobId;
           _isMining = data["is_mining"] as bool? ?? _isMining;
+
+          if (data["gpu_name"] != null && (data["gpu_name"] as String).isNotEmpty) {
+            _gpuName = data["gpu_name"] as String;
+          }
+          if (data["mining_mode"] != null) {
+            _isRpcMode = (data["mining_mode"] as String) == "btcrpc";
+          }
+
           _recordHashrate(_liveMh);
+        } else if (type == "gpu_info") {
+          if (data["gpu_name"] != null) {
+            _gpuName = data["gpu_name"] as String;
+          }
         } else if (type == "status") {
           _isMining = data["is_mining"] as bool? ?? _isMining;
+          if (data["gpu_enabled"] != null) {
+            _gpuEnabled = data["gpu_enabled"] as bool;
+          }
+          if (data["mining_mode"] != null) {
+            _isRpcMode = (data["mining_mode"] as String) == "btcrpc";
+          }
         } else if (type == "accepted") {
           _acceptedShares = (data["accepted"] as num?)?.toInt() ?? _acceptedShares;
+          _triggerShareChime();
         } else if (type == "difficulty") {
           _difficulty = (data["difficulty"] as num?)?.toDouble() ?? _difficulty;
         } else if (type == "job") {
           _jobId = data["job_id"] as String? ?? _jobId;
         } else if (type == "log") {
           final line = data["line"] as String? ?? "";
-          if (_logs.length > 800) _logs.removeAt(0);
+          if (_logs.length > 1000) _logs.removeAt(0);
           _logs.add(line);
         }
       });
@@ -244,11 +305,16 @@ class _MinerDashboardState extends State<MinerDashboard> with SingleTickerProvid
       final port = int.tryParse(_portController.text.trim()) ?? 3333;
       _channel?.sink.add(jsonEncode({
         "action": "start",
+        "mode": _isRpcMode ? "btcrpc" : "stratum",
+        "enable_gpu": _gpuEnabled,
+        "threads": _threads,
         "pool": _poolController.text.trim(),
         "port": port,
-        "user": _userController.text.trim(),
+        "user": _isRpcMode ? _rpcAddressController.text.trim() : _userController.text.trim(),
         "password": _passController.text.trim(),
-        "threads": _threads,
+        "rpc_url": _rpcUrlController.text.trim(),
+        "rpc_user": _rpcUserController.text.trim(),
+        "rpc_password": _rpcPassController.text.trim(),
       }));
     }
   }
@@ -270,7 +336,7 @@ class _MinerDashboardState extends State<MinerDashboard> with SingleTickerProvid
   @override
   Widget build(BuildContext context) {
     final screenWidth = MediaQuery.of(context).size.width;
-    final isWide = screenWidth >= 1000;
+    final isWide = screenWidth >= 1060;
 
     return Scaffold(
       appBar: _buildTopBar(),
@@ -314,30 +380,52 @@ class _MinerDashboardState extends State<MinerDashboard> with SingleTickerProvid
             ),
           ),
           const SizedBox(width: 12),
-          const Column(
+          Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Text(
-                'BITCOIN STRATUM V1 MINER',
+              const Text(
+                'BITCOIN HYBRID MINER (SHA-NI + OPENCL)',
                 style: TextStyle(
-                  fontSize: 16,
+                  fontSize: 15,
                   fontWeight: FontWeight.bold,
                   letterSpacing: 0.8,
                   color: Colors.white,
                 ),
               ),
               Text(
-                'SHA-256d Dual-Transform Midstate • Intel Core i5 Engine',
-                style: TextStyle(fontSize: 11, color: Colors.white54),
+                'Dual-Transform Midstate • Intel Core i5 & ${_gpuName.split('(').first.trim()}',
+                style: const TextStyle(fontSize: 11, color: Colors.white54),
               ),
             ],
           ),
         ],
       ),
       actions: [
+        // Mode indicator
+        Container(
+          margin: const EdgeInsets.symmetric(vertical: 12, horizontal: 4),
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+          decoration: BoxDecoration(
+            color: _isRpcMode ? const Color(0xFFBC8CFF).withValues(alpha: 0.18) : const Color(0xFF58A6FF).withValues(alpha: 0.18),
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(
+              color: _isRpcMode ? const Color(0xFFBC8CFF) : const Color(0xFF58A6FF),
+              width: 1,
+            ),
+          ),
+          child: Text(
+            _isRpcMode ? "BITCOIN CORE RPC" : "STRATUM POOL",
+            style: TextStyle(
+              fontSize: 11,
+              fontWeight: FontWeight.bold,
+              color: _isRpcMode ? const Color(0xFFD2A8FF) : const Color(0xFF79C0FF),
+            ),
+          ),
+        ),
+
         // Bridge Status
         Container(
-          margin: const EdgeInsets.symmetric(vertical: 12, horizontal: 8),
+          margin: const EdgeInsets.symmetric(vertical: 12, horizontal: 4),
           padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
           decoration: BoxDecoration(
             color: _isConnected ? const Color(0xFF238636).withValues(alpha: 0.2) : const Color(0xFFDA3633).withValues(alpha: 0.2),
@@ -360,7 +448,7 @@ class _MinerDashboardState extends State<MinerDashboard> with SingleTickerProvid
               ),
               const SizedBox(width: 6),
               Text(
-                _isConnected ? "BRIDGE CONNECTED" : "BRIDGE OFFLINE",
+                _isConnected ? "BRIDGE ONLINE" : "BRIDGE OFFLINE",
                 style: TextStyle(
                   fontSize: 11,
                   fontWeight: FontWeight.w600,
@@ -370,9 +458,10 @@ class _MinerDashboardState extends State<MinerDashboard> with SingleTickerProvid
             ],
           ),
         ),
+
         // Mining Status Indicator
         Container(
-          margin: const EdgeInsets.only(right: 16, top: 12, bottom: 12),
+          margin: const EdgeInsets.only(right: 16, top: 12, bottom: 12, left: 4),
           padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
           decoration: BoxDecoration(
             color: _isMining ? const Color(0xFFF7931A).withValues(alpha: 0.2) : Colors.white10,
@@ -416,9 +505,9 @@ class _MinerDashboardState extends State<MinerDashboard> with SingleTickerProvid
     return Row(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        // Left Column: Controls & Configuration (width 390)
+        // Left Column: Controls & Configuration (width 410)
         SizedBox(
-          width: 390,
+          width: 410,
           child: SingleChildScrollView(
             child: Column(
               children: [
@@ -474,126 +563,262 @@ class _MinerDashboardState extends State<MinerDashboard> with SingleTickerProvid
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Row(
-            children: [
-              Icon(Icons.tune_rounded, color: Color(0xFFF7931A), size: 18),
-              SizedBox(width: 8),
-              Text(
-                'MINING CONFIGURATION',
-                style: TextStyle(
-                  fontSize: 13,
-                  fontWeight: FontWeight.bold,
-                  letterSpacing: 0.5,
-                  color: Colors.white70,
+          // Mining Mode Switcher Tabs
+          Container(
+            padding: const EdgeInsets.all(3),
+            decoration: BoxDecoration(
+              color: const Color(0xFF0D1117),
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: const Color(0xFF30363D)),
+            ),
+            child: Row(
+              children: [
+                Expanded(
+                  child: InkWell(
+                    onTap: _isMining ? null : () => setState(() => _isRpcMode = false),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(vertical: 8),
+                      decoration: BoxDecoration(
+                        color: !_isRpcMode ? const Color(0xFFF7931A).withValues(alpha: 0.25) : Colors.transparent,
+                        borderRadius: BorderRadius.circular(6),
+                        border: Border.all(
+                          color: !_isRpcMode ? const Color(0xFFF7931A) : Colors.transparent,
+                        ),
+                      ),
+                      child: Center(
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Icon(Icons.hub_rounded, size: 14, color: !_isRpcMode ? const Color(0xFFF7931A) : Colors.white54),
+                            const SizedBox(width: 6),
+                            Text(
+                              "Stratum Pool",
+                              style: TextStyle(
+                                fontSize: 12,
+                                fontWeight: FontWeight.bold,
+                                color: !_isRpcMode ? Colors.white : Colors.white54,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
                 ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 14),
-
-          // Preset Chips
-          const Text("Pool Preset", style: TextStyle(fontSize: 12, color: Colors.white60)),
-          const SizedBox(height: 6),
-          Wrap(
-            spacing: 8,
-            runSpacing: 6,
-            children: [
-              ChoiceChip(
-                label: const Text("Solo CKPool"),
-                selected: _selectedPreset == PoolPreset.soloCkPool,
-                onSelected: (val) {
-                  if (val && !_isMining) _applyPreset(PoolPreset.soloCkPool);
-                },
-                selectedColor: const Color(0xFFF7931A).withValues(alpha: 0.3),
-                side: BorderSide(
-                  color: _selectedPreset == PoolPreset.soloCkPool ? const Color(0xFFF7931A) : Colors.white24,
+                const SizedBox(width: 4),
+                Expanded(
+                  child: InkWell(
+                    onTap: _isMining ? null : () => setState(() => _isRpcMode = true),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(vertical: 8),
+                      decoration: BoxDecoration(
+                        color: _isRpcMode ? const Color(0xFFBC8CFF).withValues(alpha: 0.25) : Colors.transparent,
+                        borderRadius: BorderRadius.circular(6),
+                        border: Border.all(
+                          color: _isRpcMode ? const Color(0xFFBC8CFF) : Colors.transparent,
+                        ),
+                      ),
+                      child: Center(
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Icon(Icons.storage_rounded, size: 14, color: _isRpcMode ? const Color(0xFFD2A8FF) : Colors.white54),
+                            const SizedBox(width: 6),
+                            Text(
+                              "Bitcoin Core RPC",
+                              style: TextStyle(
+                                fontSize: 12,
+                                fontWeight: FontWeight.bold,
+                                color: _isRpcMode ? Colors.white : Colors.white54,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
                 ),
-              ),
-              ChoiceChip(
-                label: const Text("Binance Pool"),
-                selected: _selectedPreset == PoolPreset.binancePool,
-                onSelected: (val) {
-                  if (val && !_isMining) _applyPreset(PoolPreset.binancePool);
-                },
-                selectedColor: const Color(0xFFF7931A).withValues(alpha: 0.3),
-                side: BorderSide(
-                  color: _selectedPreset == PoolPreset.binancePool ? const Color(0xFFF7931A) : Colors.white24,
-                ),
-              ),
-              ChoiceChip(
-                label: const Text("Custom"),
-                selected: _selectedPreset == PoolPreset.custom,
-                onSelected: (val) {
-                  if (val && !_isMining) _applyPreset(PoolPreset.custom);
-                },
-                selectedColor: const Color(0xFFF7931A).withValues(alpha: 0.3),
-                side: BorderSide(
-                  color: _selectedPreset == PoolPreset.custom ? const Color(0xFFF7931A) : Colors.white24,
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 14),
-
-          // Pool Host & Port
-          Row(
-            children: [
-              Expanded(
-                flex: 3,
-                child: _buildTextField(
-                  label: "Stratum Host",
-                  controller: _poolController,
-                  enabled: !_isMining,
-                ),
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                flex: 1,
-                child: _buildTextField(
-                  label: "Port",
-                  controller: _portController,
-                  enabled: !_isMining,
-                  isNumber: true,
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 12),
-
-          // Username / Wallet Address
-          _buildTextField(
-            label: "Stratum User / BTC Wallet Address",
-            controller: _userController,
-            enabled: !_isMining,
-          ),
-          const SizedBox(height: 12),
-
-          // Password
-          _buildTextField(
-            label: "Password",
-            controller: _passController,
-            enabled: !_isMining,
+              ],
+            ),
           ),
           const SizedBox(height: 16),
 
-          // Thread Count Slider
+          if (!_isRpcMode) ...[
+            // Pool Preset
+            const Text("Stratum Pool Preset", style: TextStyle(fontSize: 11, color: Colors.white60)),
+            const SizedBox(height: 6),
+            Wrap(
+              spacing: 8,
+              runSpacing: 6,
+              children: [
+                ChoiceChip(
+                  label: const Text("Solo CKPool"),
+                  selected: _selectedPreset == PoolPreset.soloCkPool,
+                  onSelected: (val) {
+                    if (val && !_isMining) _applyPreset(PoolPreset.soloCkPool);
+                  },
+                  selectedColor: const Color(0xFFF7931A).withValues(alpha: 0.3),
+                  side: BorderSide(
+                    color: _selectedPreset == PoolPreset.soloCkPool ? const Color(0xFFF7931A) : Colors.white24,
+                  ),
+                ),
+                ChoiceChip(
+                  label: const Text("Binance Pool"),
+                  selected: _selectedPreset == PoolPreset.binancePool,
+                  onSelected: (val) {
+                    if (val && !_isMining) _applyPreset(PoolPreset.binancePool);
+                  },
+                  selectedColor: const Color(0xFFF7931A).withValues(alpha: 0.3),
+                  side: BorderSide(
+                    color: _selectedPreset == PoolPreset.binancePool ? const Color(0xFFF7931A) : Colors.white24,
+                  ),
+                ),
+                ChoiceChip(
+                  label: const Text("Custom"),
+                  selected: _selectedPreset == PoolPreset.custom,
+                  onSelected: (val) {
+                    if (val && !_isMining) _applyPreset(PoolPreset.custom);
+                  },
+                  selectedColor: const Color(0xFFF7931A).withValues(alpha: 0.3),
+                  side: BorderSide(
+                    color: _selectedPreset == PoolPreset.custom ? const Color(0xFFF7931A) : Colors.white24,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 14),
+
+            // Pool Host & Port
+            Row(
+              children: [
+                Expanded(
+                  flex: 3,
+                  child: _buildTextField(
+                    label: "Stratum Host",
+                    controller: _poolController,
+                    enabled: !_isMining,
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  flex: 1,
+                  child: _buildTextField(
+                    label: "Port",
+                    controller: _portController,
+                    enabled: !_isMining,
+                    isNumber: true,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+
+            // Username / Wallet Address
+            _buildTextField(
+              label: "Stratum User / Worker / BTC Address",
+              controller: _userController,
+              enabled: !_isMining,
+            ),
+            const SizedBox(height: 12),
+
+            // Password
+            _buildTextField(
+              label: "Password",
+              controller: _passController,
+              enabled: !_isMining,
+            ),
+          ] else ...[
+            // Bitcoin Core RPC Solo Inputs
+            Container(
+              padding: const EdgeInsets.all(10),
+              margin: const EdgeInsets.only(bottom: 12),
+              decoration: BoxDecoration(
+                color: const Color(0xFFBC8CFF).withValues(alpha: 0.1),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: const Color(0xFFBC8CFF).withValues(alpha: 0.3)),
+              ),
+              child: const Row(
+                children: [
+                  Icon(Icons.info_outline_rounded, size: 16, color: Color(0xFFD2A8FF)),
+                  SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      "Solo mode queries local node via getblocktemplate (BIP22/23) & submits blocks directly.",
+                      style: TextStyle(fontSize: 11, color: Colors.white70),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            _buildTextField(
+              label: "Bitcoin Core RPC URL",
+              controller: _rpcUrlController,
+              enabled: !_isMining,
+            ),
+            const SizedBox(height: 10),
+            Row(
+              children: [
+                Expanded(
+                  child: _buildTextField(
+                    label: "RPC Username",
+                    controller: _rpcUserController,
+                    enabled: !_isMining,
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: _buildTextField(
+                    label: "RPC Password",
+                    controller: _rpcPassController,
+                    enabled: !_isMining,
+                    isPassword: true,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            _buildTextField(
+              label: "Block Reward Payout Address",
+              controller: _rpcAddressController,
+              enabled: !_isMining,
+            ),
+          ],
+
+          const SizedBox(height: 18),
+          const Divider(color: Color(0xFF30363D), height: 1),
+          const SizedBox(height: 14),
+
+          // Hardware Engine Configurations
+          const Row(
+            children: [
+              Icon(Icons.memory_rounded, color: Color(0xFF58A6FF), size: 16),
+              SizedBox(width: 6),
+              Text(
+                "HARDWARE MINING ENGINES",
+                style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, letterSpacing: 0.5, color: Colors.white70),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+
+          // CPU Engine Slider
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              const Text("Mining Threads (CPU)", style: TextStyle(fontSize: 12, color: Colors.white60)),
+              const Text("CPU Worker Threads (SHA-NI)", style: TextStyle(fontSize: 12, color: Colors.white60)),
               Container(
                 padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
                 decoration: BoxDecoration(
-                  color: const Color(0xFFF7931A).withValues(alpha: 0.15),
+                  color: const Color(0xFF58A6FF).withValues(alpha: 0.15),
                   borderRadius: BorderRadius.circular(6),
-                  border: Border.all(color: const Color(0xFFF7931A).withValues(alpha: 0.4)),
+                  border: Border.all(color: const Color(0xFF58A6FF).withValues(alpha: 0.4)),
                 ),
                 child: Text(
                   "$_threads Threads",
                   style: const TextStyle(
                     fontSize: 12,
                     fontWeight: FontWeight.bold,
-                    color: Color(0xFFF7931A),
+                    color: Color(0xFF58A6FF),
                   ),
                 ),
               ),
@@ -601,10 +826,10 @@ class _MinerDashboardState extends State<MinerDashboard> with SingleTickerProvid
           ),
           SliderTheme(
             data: SliderTheme.of(context).copyWith(
-              activeTrackColor: const Color(0xFFF7931A),
-              thumbColor: const Color(0xFFF7931A),
-              overlayColor: const Color(0xFFF7931A).withValues(alpha: 0.2),
-              valueIndicatorColor: const Color(0xFFF7931A),
+              activeTrackColor: const Color(0xFF58A6FF),
+              thumbColor: const Color(0xFF58A6FF),
+              overlayColor: const Color(0xFF58A6FF).withValues(alpha: 0.2),
+              valueIndicatorColor: const Color(0xFF58A6FF),
             ),
             child: Slider(
               value: _threads.toDouble(),
@@ -617,6 +842,70 @@ class _MinerDashboardState extends State<MinerDashboard> with SingleTickerProvid
                   : (val) {
                       setState(() => _threads = val.round());
                     },
+            ),
+          ),
+
+          // GPU Engine Toggle Switch Card
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            decoration: BoxDecoration(
+              color: const Color(0xFF0D1117),
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(
+                color: _gpuEnabled ? const Color(0xFFBC8CFF).withValues(alpha: 0.4) : const Color(0xFF30363D),
+              ),
+            ),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          Icon(
+                            Icons.videogame_asset_rounded,
+                            size: 15,
+                            color: _gpuEnabled ? const Color(0xFFD2A8FF) : Colors.white38,
+                          ),
+                          const SizedBox(width: 6),
+                          Text(
+                            "OpenCL GPU Engine",
+                            style: TextStyle(
+                              fontSize: 12,
+                              fontWeight: FontWeight.bold,
+                              color: _gpuEnabled ? Colors.white : Colors.white60,
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        _gpuName,
+                        style: const TextStyle(fontSize: 10, color: Colors.white38),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      const SizedBox(height: 1),
+                      Text(
+                        _gpuEnabled
+                            ? "Nonce Partition: CPU [0x0..0x7FFFFFFF] | GPU [0x80000000..0xFFFFFFFF]"
+                            : "GPU Worker Disabled (CPU-Only Mode)",
+                        style: TextStyle(
+                          fontSize: 9.5,
+                          color: _gpuEnabled ? const Color(0xFF3FB950) : Colors.white38,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                Switch(
+                  value: _gpuEnabled,
+                  onChanged: _isMining ? null : (val) => setState(() => _gpuEnabled = val),
+                  activeThumbColor: const Color(0xFFD2A8FF),
+                  activeTrackColor: const Color(0xFF8957E5),
+                ),
+              ],
             ),
           ),
         ],
@@ -651,7 +940,7 @@ class _MinerDashboardState extends State<MinerDashboard> with SingleTickerProvid
                   Icon(_isMining ? Icons.stop_rounded : Icons.play_arrow_rounded, size: 26),
                   const SizedBox(width: 8),
                   Text(
-                    _isMining ? "STOP MINING" : "START MINING",
+                    _isMining ? "STOP MINING RIG" : "START HYBRID MINER",
                     style: const TextStyle(
                       fontSize: 16,
                       fontWeight: FontWeight.bold,
@@ -665,8 +954,8 @@ class _MinerDashboardState extends State<MinerDashboard> with SingleTickerProvid
           const SizedBox(height: 10),
           Text(
             _isMining
-                ? "Mining active on $_threads threads. Click to safely shut down worker threads."
-                : "Configure pool parameters above and click Start Mining.",
+                ? "Mining active on $_threads CPU threads${_gpuEnabled ? " + Intel Iris Xe GPU" : ""}. Click to halt worker engines."
+                : "Select mode and parameters above, then launch the hybrid mining rig.",
             textAlign: TextAlign.center,
             style: const TextStyle(fontSize: 11, color: Colors.white54),
           ),
@@ -680,6 +969,7 @@ class _MinerDashboardState extends State<MinerDashboard> with SingleTickerProvid
     required TextEditingController controller,
     required bool enabled,
     bool isNumber = false,
+    bool isPassword = false,
   }) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -689,6 +979,7 @@ class _MinerDashboardState extends State<MinerDashboard> with SingleTickerProvid
         TextField(
           controller: controller,
           enabled: enabled,
+          obscureText: isPassword,
           keyboardType: isNumber ? TextInputType.number : TextInputType.text,
           style: const TextStyle(fontSize: 13, color: Colors.white),
           decoration: InputDecoration(
@@ -717,7 +1008,7 @@ class _MinerDashboardState extends State<MinerDashboard> with SingleTickerProvid
   Widget _buildTelemetrySection() {
     return Column(
       children: [
-        // Hero Hashrate Display + Real-time Line Graph
+        // Hero Aggregate Hashrate Display + Split CPU / GPU chips + Real-time Line Graph
         Container(
           padding: const EdgeInsets.all(16),
           decoration: BoxDecoration(
@@ -736,7 +1027,7 @@ class _MinerDashboardState extends State<MinerDashboard> with SingleTickerProvid
                       Icon(Icons.speed_rounded, color: Color(0xFF58A6FF), size: 20),
                       SizedBox(width: 8),
                       Text(
-                        'REAL-TIME HASHRATE',
+                        'AGGREGATE RIG HASHRATE',
                         style: TextStyle(
                           fontSize: 13,
                           fontWeight: FontWeight.bold,
@@ -785,7 +1076,84 @@ class _MinerDashboardState extends State<MinerDashboard> with SingleTickerProvid
                   ),
                 ],
               ),
-              const SizedBox(height: 12),
+              const SizedBox(height: 10),
+
+              // Split Telemetry Chips: CPU (SHA-NI) and GPU (Iris Xe)
+              Row(
+                children: [
+                  Expanded(
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF0D1117),
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: const Color(0xFF58A6FF).withValues(alpha: 0.4)),
+                      ),
+                      child: Row(
+                        children: [
+                          Container(
+                            width: 7,
+                            height: 7,
+                            decoration: const BoxDecoration(
+                              shape: BoxShape.circle,
+                              color: Color(0xFF58A6FF),
+                            ),
+                          ),
+                          const SizedBox(width: 6),
+                          const Text(
+                            "⚡ CPU (SHA-NI): ",
+                            style: TextStyle(fontSize: 11, color: Colors.white60),
+                          ),
+                          Text(
+                            "${_cpuMh.toStringAsFixed(2)} MH/s",
+                            style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Color(0xFF79C0FF)),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF0D1117),
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(
+                          color: _gpuEnabled ? const Color(0xFFBC8CFF).withValues(alpha: 0.4) : const Color(0xFF30363D),
+                        ),
+                      ),
+                      child: Row(
+                        children: [
+                          Container(
+                            width: 7,
+                            height: 7,
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              color: _gpuEnabled ? const Color(0xFFD2A8FF) : Colors.white24,
+                            ),
+                          ),
+                          const SizedBox(width: 6),
+                          const Text(
+                            "🚀 GPU (Iris Xe): ",
+                            style: TextStyle(fontSize: 11, color: Colors.white60),
+                          ),
+                          Text(
+                            _gpuEnabled ? "${_gpuMh.toStringAsFixed(2)} MH/s" : "Disabled",
+                            style: TextStyle(
+                              fontSize: 12,
+                              fontWeight: FontWeight.bold,
+                              color: _gpuEnabled ? const Color(0xFFD2A8FF) : Colors.white38,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 14),
+
               // Hashrate Canvas Graph
               SizedBox(
                 height: 100,
@@ -843,9 +1211,9 @@ class _MinerDashboardState extends State<MinerDashboard> with SingleTickerProvid
             const SizedBox(width: 12),
             Expanded(
               child: _buildMetricCard(
-                title: "POOL DIFFICULTY",
+                title: _isRpcMode ? "NETWORK DIFF" : "POOL DIFFICULTY",
                 value: _difficulty >= 1000 ? "${(_difficulty / 1000).toStringAsFixed(1)}k" : _difficulty.toStringAsFixed(2),
-                subtitle: "Target Share Diff",
+                subtitle: _isRpcMode ? "Block Target Diff" : "Target Share Diff",
                 icon: Icons.military_tech_rounded,
                 iconColor: const Color(0xFFBC8CFF),
               ),
@@ -936,9 +1304,9 @@ class _MinerDashboardState extends State<MinerDashboard> with SingleTickerProvid
               children: [
                 const Icon(Icons.terminal_rounded, size: 16, color: Colors.white60),
                 const SizedBox(width: 8),
-                const Text(
-                  'STRATUM ENGINE CONSOLE',
-                  style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, letterSpacing: 0.5, color: Colors.white70),
+                Text(
+                  _isRpcMode ? 'BITCOIN CORE RPC ENGINE CONSOLE' : 'STRATUM ENGINE CONSOLE',
+                  style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, letterSpacing: 0.5, color: Colors.white70),
                 ),
                 const Spacer(),
                 // Auto-scroll Switch
@@ -969,7 +1337,7 @@ class _MinerDashboardState extends State<MinerDashboard> with SingleTickerProvid
             child: _logs.isEmpty
                 ? const Center(
                     child: Text(
-                      "No log events yet. Start the miner to view Stratum communication.",
+                      "No log events yet. Start the miner to view engine communication.",
                       style: TextStyle(fontSize: 12, color: Colors.white24, fontStyle: FontStyle.italic),
                     ),
                   )
@@ -980,13 +1348,15 @@ class _MinerDashboardState extends State<MinerDashboard> with SingleTickerProvid
                     itemBuilder: (context, index) {
                       final line = _logs[index];
                       Color color = Colors.white70;
-                      if (line.contains("SHARE ACCEPTED") || line.contains("[+]")) {
+                      if (line.contains("SHARE ACCEPTED") || line.contains("BLOCK ACCEPTED") || line.contains("[+]")) {
                         color = const Color(0xFF3FB950);
                       } else if (line.contains("SHARE REJECTED") || line.contains("[-]")) {
                         color = const Color(0xFFF85149);
+                      } else if (line.contains("GPU") || line.contains("OpenCL") || line.contains("Iris Xe")) {
+                        color = const Color(0xFFD2A8FF);
                       } else if (line.contains("[*]")) {
                         color = const Color(0xFF58A6FF);
-                      } else if (line.contains("Difficulty") || line.contains("JobID")) {
+                      } else if (line.contains("Difficulty") || line.contains("JobID") || line.contains("Block #")) {
                         color = const Color(0xFFBC8CFF);
                       }
 

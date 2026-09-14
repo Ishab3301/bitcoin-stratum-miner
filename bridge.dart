@@ -10,6 +10,8 @@ final Set<WebSocket> clients = {};
 bool isMining = false;
 
 double liveMh = 0.0;
+double cpuMh = 0.0;
+double gpuMh = 0.0;
 double avg5sMh = 0.0;
 double totalAvgMh = 0.0;
 int totalHashes = 0;
@@ -19,6 +21,9 @@ double currentDifficulty = 1.0;
 String currentJobId = "-";
 String currentPool = "solo.ckpool.org:3333";
 int activeThreads = 6;
+bool gpuEnabled = true;
+String gpuDeviceName = "Intel(R) Iris(R) Xe Graphics (80 CUs)";
+String miningMode = "stratum";
 final List<String> logBuffer = [];
 
 void broadcast(Map<String, dynamic> data) {
@@ -39,7 +44,59 @@ void appendLog(String line) {
 void parseMinerLine(String line) {
   appendLog(line);
 
-  // Parse: [*] Live: 3.85 MH/s (5s: 3.75 | Avg: 3.60) | Hashes: 12000000 | Accepted: 1 | Rejected: 0
+  // Parse GPU Engine Name
+  if (line.contains("GPU Cryptographic Engine:")) {
+    final gName = line.split("GPU Cryptographic Engine:").last.trim();
+    if (!gName.contains("None detected")) {
+      gpuDeviceName = gName;
+      broadcast({"type": "gpu_info", "gpu_name": gpuDeviceName});
+    }
+  }
+
+  // Parse Hybrid Live Telemetry:
+  // [*] Live: 99.74 MH/s (CPU: 25.08 | GPU: 74.66 | 5s: 97.00 | Avg: 95.00) | Hashes: 503642626 | Accepted: 1 | Rejected: 0
+  final hybridLiveRegex = RegExp(r'Live:\s*([\d\.]+)\s*MH/s\s*\(CPU:\s*([\d\.]+)\s*\|\s*GPU:\s*([\d\.]+)');
+  final hMatch = hybridLiveRegex.firstMatch(line);
+  if (hMatch != null) {
+    liveMh = double.tryParse(hMatch.group(1) ?? "0") ?? liveMh;
+    cpuMh = double.tryParse(hMatch.group(2) ?? "0") ?? cpuMh;
+    gpuMh = double.tryParse(hMatch.group(3) ?? "0") ?? gpuMh;
+
+    final avg5sMatch = RegExp(r'5s:\s*([\d\.]+)').firstMatch(line);
+    if (avg5sMatch != null) avg5sMh = double.tryParse(avg5sMatch.group(1) ?? "0") ?? avg5sMh;
+
+    final totalAvgMatch = RegExp(r'Avg:\s*([\d\.]+)').firstMatch(line);
+    if (totalAvgMatch != null) totalAvgMh = double.tryParse(totalAvgMatch.group(1) ?? "0") ?? totalAvgMh;
+
+    final hashMatch = RegExp(r'Hashes:\s*(\d+)').firstMatch(line);
+    if (hashMatch != null) totalHashes = int.tryParse(hashMatch.group(1) ?? "0") ?? totalHashes;
+
+    final accMatch = RegExp(r'Accepted:\s*(\d+)').firstMatch(line);
+    if (accMatch != null) acceptedShares = int.tryParse(accMatch.group(1) ?? "0") ?? acceptedShares;
+
+    final rejMatch = RegExp(r'Rejected:\s*(\d+)').firstMatch(line);
+    if (rejMatch != null) rejectedShares = int.tryParse(rejMatch.group(1) ?? "0") ?? rejectedShares;
+
+    broadcast({
+      "type": "telemetry",
+      "live_mh": liveMh,
+      "cpu_mh": cpuMh,
+      "gpu_mh": gpuMh,
+      "avg_5s": avg5sMh,
+      "total_avg": totalAvgMh,
+      "total_hashes": totalHashes,
+      "accepted": acceptedShares,
+      "rejected": rejectedShares,
+      "difficulty": currentDifficulty,
+      "job_id": currentJobId,
+      "is_mining": isMining,
+      "gpu_name": gpuDeviceName,
+      "mining_mode": miningMode,
+    });
+    return;
+  }
+
+  // Parse Legacy Live Telemetry:
   final liveRegex = RegExp(r'Live:\s*([\d\.]+)\s*MH/s\s*\(5s:\s*([\d\.]+)\s*\|\s*Avg:\s*([\d\.]+)\)\s*\|\s*Hashes:\s*(\d+)\s*\|\s*Accepted:\s*(\d+)\s*\|\s*Rejected:\s*(\d+)');
   final liveMatch = liveRegex.firstMatch(line);
   if (liveMatch != null) {
@@ -53,6 +110,8 @@ void parseMinerLine(String line) {
     broadcast({
       "type": "telemetry",
       "live_mh": liveMh,
+      "cpu_mh": cpuMh,
+      "gpu_mh": gpuMh,
       "avg_5s": avg5sMh,
       "total_avg": totalAvgMh,
       "total_hashes": totalHashes,
@@ -61,6 +120,8 @@ void parseMinerLine(String line) {
       "difficulty": currentDifficulty,
       "job_id": currentJobId,
       "is_mining": isMining,
+      "gpu_name": gpuDeviceName,
+      "mining_mode": miningMode,
     });
     return;
   }
@@ -84,7 +145,7 @@ void parseMinerLine(String line) {
   }
 
   // Parse: SHARE ACCEPTED!
-  if (line.contains("SHARE ACCEPTED")) {
+  if (line.contains("SHARE ACCEPTED") || line.contains("BLOCK ACCEPTED")) {
     acceptedShares++;
     broadcast({"type": "accepted", "accepted": acceptedShares});
   }
@@ -93,38 +154,75 @@ void parseMinerLine(String line) {
 Future<void> startMining(Map<String, dynamic> params) async {
   if (isMining) return;
 
+  final mode = params["mode"] as String? ?? "stratum";
+  miningMode = mode;
+  final enableGpu = params["enable_gpu"] as bool? ?? true;
+  gpuEnabled = enableGpu;
+
   final pool = params["pool"] as String? ?? "solo.ckpool.org";
   final port = (params["port"] is num) ? (params["port"] as num).toInt() : int.tryParse(params["port"]?.toString() ?? "3333") ?? 3333;
   final user = params["user"] as String? ?? "1EUeWGhrKsrSmicJoSgYVgbbNAT4hFBzqS";
   final password = params["password"] as String? ?? "x";
   final threads = (params["threads"] is num) ? (params["threads"] as num).toInt() : int.tryParse(params["threads"]?.toString() ?? "6") ?? 6;
 
-  currentPool = "$pool:$port";
+  final rpcUrl = params["rpc_url"] as String? ?? "http://127.0.0.1:8332";
+  final rpcUser = params["rpc_user"] as String? ?? "bitcoin";
+  final rpcPassword = params["rpc_password"] as String? ?? "password";
+
+  currentPool = mode == "btcrpc" ? rpcUrl : "$pool:$port";
   activeThreads = threads;
   liveMh = 0.0;
+  cpuMh = 0.0;
+  gpuMh = 0.0;
   avg5sMh = 0.0;
   totalAvgMh = 0.0;
   totalHashes = 0;
   acceptedShares = 0;
   rejectedShares = 0;
 
-  appendLog("[*] Launching miner.exe ($pool:$port | $user | $threads threads)...");
+  final args = <String>[];
+  if (mode == "btcrpc") {
+    appendLog("[*] Launching miner.exe in Bitcoin Core RPC Solo Mode ($rpcUrl | $user)...");
+    args.addAll([
+      "--rpc-url", rpcUrl,
+      "--rpc-user", rpcUser,
+      "--rpc-password", rpcPassword,
+      "--user", user,
+      "--threads", threads.toString(),
+    ]);
+  } else {
+    appendLog("[*] Launching miner.exe ($pool:$port | $user | $threads threads)...");
+    args.addAll([
+      "--pool", pool,
+      "--port", port.toString(),
+      "--user", user,
+      "--password", password,
+      "--threads", threads.toString(),
+    ]);
+  }
+
+  if (!enableGpu) {
+    args.add("--no-gpu");
+  } else {
+    args.add("--gpu");
+  }
 
   try {
     minerProcess = await Process.start(
       "miner.exe",
-      [
-        "--pool", pool,
-        "--port", port.toString(),
-        "--user", user,
-        "--password", password,
-        "--threads", threads.toString(),
-      ],
+      args,
       workingDirectory: Directory.current.path,
     );
 
     isMining = true;
-    broadcast({"type": "status", "is_mining": true, "pool": currentPool, "threads": activeThreads});
+    broadcast({
+      "type": "status",
+      "is_mining": true,
+      "pool": currentPool,
+      "threads": activeThreads,
+      "gpu_enabled": gpuEnabled,
+      "mining_mode": miningMode,
+    });
 
     minerProcess!.stdout.transform(utf8.decoder).transform(const LineSplitter()).listen(parseMinerLine);
     minerProcess!.stderr.transform(utf8.decoder).transform(const LineSplitter()).listen((err) => appendLog("[-] $err"));
@@ -188,6 +286,8 @@ Future<void> main() async {
         "type": "init",
         "is_mining": isMining,
         "live_mh": liveMh,
+        "cpu_mh": cpuMh,
+        "gpu_mh": gpuMh,
         "avg_5s": avg5sMh,
         "total_avg": totalAvgMh,
         "total_hashes": totalHashes,
@@ -197,6 +297,9 @@ Future<void> main() async {
         "job_id": currentJobId,
         "pool": currentPool,
         "threads": activeThreads,
+        "gpu_enabled": gpuEnabled,
+        "gpu_name": gpuDeviceName,
+        "mining_mode": miningMode,
         "logs": logBuffer,
       }));
 
