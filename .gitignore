@@ -1,0 +1,24 @@
+﻿# Binaries and compiled executables
+*.exe
+*.o
+*.obj
+*.dll
+*.so
+*.dylib
+
+# Runtime logs
+rejected_shares.txt
+*.log
+
+# Flutter and Dart build artifacts
+gui/.dart_tool/
+gui/build/
+gui/.flutter-plugins
+gui/.flutter-plugins-dependencies
+gui/.pub-cache/
+gui/.pub/
+
+# IDE and Editor files
+.idea/
+.vscode/
+*.iml
